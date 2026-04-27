@@ -41,6 +41,14 @@ STATUS_PENDING = "⟳ Pending"
 STATUS_ERROR   = "✗ Error"
 STATUS_IGNORED = "— Ignored"
 
+# Emblem names from the system icon theme overlaid on file icons
+_STATUS_EMBLEM = {
+    STATUS_SYNCED:  "emblem-default",       # green checkmark
+    STATUS_PENDING: "emblem-synchronizing", # spinning arrows
+    STATUS_ERROR:   "emblem-important",     # red/yellow warning
+    STATUS_IGNORED: None,                   # no emblem
+}
+
 # ---------------------------------------------------------------------------
 # DB loader: builds a dict of absolute_path -> status_string
 # ---------------------------------------------------------------------------
@@ -151,20 +159,18 @@ class MarunjaSyncProvider(GObject.GObject, Nautilus.ColumnProvider, Nautilus.Inf
         abs_path = file.get_location().get_path()
         status = _cache.get(abs_path)
 
-        # Debug: log misses inside sync dirs
         if status is None:
             for profile in PROFILES:
                 if abs_path == profile["sync_dir"]:
-                    status = STATUS_SYNCED  # root sync folder itself
+                    status = STATUS_SYNCED
                     break
-                elif abs_path.startswith(profile["sync_dir"]):
-                    status = STATUS_IGNORED
-                    break
-
-        if status is None:
-            for profile in PROFILES:
-                if abs_path.startswith(profile["sync_dir"]):
+                elif abs_path.startswith(profile["sync_dir"] + "/"):
                     status = STATUS_IGNORED
                     break
 
         file.add_string_attribute("sync_status", status or "")
+
+        # Emblem overlay on the file icon
+        emblem = _STATUS_EMBLEM.get(status)
+        if emblem:
+            file.add_emblem(emblem)
