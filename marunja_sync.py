@@ -80,6 +80,31 @@ SELECT full_path, syncStatus FROM path_cte WHERE full_path != ''
 """
 
 
+def _get_skip_patterns(confdir: str) -> set:
+    """Read skip_dir and skip_file patterns from onedrive config."""
+    patterns = set()
+    for key in ("skip_dir", "skip_file"):
+        val = _config_get(confdir, key)
+        if val:
+            for p in val.split("|"):
+                p = p.strip()
+                if p:
+                    patterns.add(p)
+    return patterns
+
+
+def _is_excluded(rel_path: str, skip_patterns: set) -> bool:
+    """Check if a relative path matches any skip pattern."""
+    parts = rel_path.split("/")
+    # Check each component and each prefix
+    for i in range(len(parts)):
+        segment = parts[i]
+        prefix = "/".join(parts[: i + 1])
+        if segment in skip_patterns or prefix in skip_patterns:
+            return True
+    return False
+
+
 def _load_profile(profile: dict) -> dict:
     """Return {absolute_path: status_string} for one profile."""
     db_path = profile["db"]
@@ -89,14 +114,18 @@ def _load_profile(profile: dict) -> dict:
     if not os.path.exists(db_path):
         return result
 
-    # Copy to temp to avoid "database is locked"
-    tmp = db_path + ".marunja_tmp"
+    skip_patterns = _get_skip_patterns(profile["confdir"])
+
+    # Unique temp file per thread to avoid cross-thread file conflicts
+    tmp = f"/tmp/marunja_{os.path.basename(db_path)}_{threading.get_ident()}.tmp"
     try:
         shutil.copy2(db_path, tmp)
         con = sqlite3.connect(tmp)
         for rel_path, sync_status in con.execute(_REBUILD_SQL):
             abs_path = sync_dir + "/" + rel_path
-            if sync_status == "Y":
+            if _is_excluded(rel_path, skip_patterns):
+                status = STATUS_EXCLUDED
+            elif sync_status == "Y":
                 status = STATUS_SYNCED
             elif sync_status is None:
                 status = STATUS_PENDING
@@ -104,7 +133,7 @@ def _load_profile(profile: dict) -> dict:
                 status = STATUS_ERROR
             result[abs_path] = status
         con.close()
-    except Exception:
+    except Exception as e:
         pass
     finally:
         try:
@@ -289,11 +318,16 @@ class MarunjaSyncProvider(GObject.GObject, Nautilus.ColumnProvider, Nautilus.Inf
 
         # While pending, re-check every 2s until status changes
         if status == STATUS_PENDING:
+            _file_ref = [file]  # prevent GC
             def _recheck():
                 if _cache.get(abs_path) == STATUS_PENDING:
-                    return True   # keep polling
-                file.invalidate_extension_info()
-                return False      # stop
+                    return True
+                try:
+                    _file_ref[0].invalidate_extension_info()
+                except Exception:
+                    pass
+                _file_ref.clear()
+                return False
             GLib.timeout_add(2000, _recheck)
 
         if status is None:
@@ -412,7 +446,10 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                 ["onedrive", "--sync", "--confdir", profile["confdir"]],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            _cache.force_reload()
+            fresh = _load_all_profiles()
+            with _cache._lock:
+                _cache._data = fresh
+                _cache._overrides.clear()
             GLib.idle_add(_invalidate_by_uris, [folder_uri])
 
         threading.Thread(target=_run, daemon=True).start()
