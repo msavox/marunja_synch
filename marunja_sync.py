@@ -19,7 +19,8 @@ import shutil
 import subprocess
 import threading
 import time
-from gi.repository import Nautilus, GObject
+import weakref
+from gi.repository import Nautilus, GObject, GLib
 
 # ---------------------------------------------------------------------------
 # Profile definitions: add more SharePoint profiles here as needed
@@ -138,6 +139,7 @@ class _SyncCache:
         self._lock = threading.Lock()
         self._data: dict = _load_all_profiles()  # initial synchronous load
         self._excluded: set = set()
+        self._overrides: dict = {}  # abs_path -> status, cleared on next reload
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -146,14 +148,18 @@ class _SyncCache:
             fresh = _load_all_profiles()
             with self._lock:
                 self._data = fresh
+                self._overrides.clear()  # DB is fresh, drop manual overrides
             time.sleep(REFRESH_INTERVAL)
 
     def get(self, abs_path: str):
         with self._lock:
-            # Check excluded set first (covers both the item and its children)
+            # Excluded takes priority
             for excl in self._excluded:
                 if abs_path == excl or abs_path.startswith(excl + "/"):
                     return STATUS_EXCLUDED
+            # Manual override (e.g. ⟳ Pending set by Sync Now)
+            if abs_path in self._overrides:
+                return self._overrides[abs_path]
             return self._data.get(abs_path)
 
     def exclude(self, abs_path: str):
@@ -161,8 +167,29 @@ class _SyncCache:
         with self._lock:
             self._excluded.add(abs_path)
 
+    def set_pending(self, abs_path: str):
+        """Show ⟳ Pending immediately while a sync is running."""
+        with self._lock:
+            self._overrides[abs_path] = STATUS_PENDING
+
+    def force_reload(self):
+        """Reload DB immediately (called after a sync completes)."""
+        fresh = _load_all_profiles()
+        with self._lock:
+            self._data = fresh
+            self._overrides.clear()
+
 
 _cache = _SyncCache()
+
+
+def _invalidate_by_uris(uris: list):
+    """Ask Nautilus to re-query extension info for a list of URIs."""
+    for uri in uris:
+        f = Nautilus.FileInfo.lookup_for_uri(uri)
+        if f:
+            f.invalidate_extension_info()
+    return False  # GLib.idle_add: don't repeat
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +318,7 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             label=f"Sync Now  [{profile['name']}]",
             tip="Force an immediate sync with OneDrive / SharePoint",
         )
-        sync_item.connect("activate", self._on_sync_now, profile)
+        sync_item.connect("activate", self._on_sync_now, profile, files)
         items.append(sync_item)
 
         # --- Exclude from Sync (not shown on the root sync dir itself) ---
@@ -318,11 +345,25 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
 
     # --- Handlers ---
 
-    def _on_sync_now(self, menu, profile):
-        subprocess.Popen(
-            ["onedrive", "--sync", "--confdir", profile["confdir"]],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+    def _on_sync_now(self, menu, profile, files):
+        # Immediately show ⟳ Pending on all selected files
+        uris = []
+        for f in files:
+            abs_path = f.get_location().get_path()
+            _cache.set_pending(abs_path)
+            f.invalidate_extension_info()
+            uris.append(f.get_uri())
+
+        def _run():
+            proc = subprocess.run(
+                ["onedrive", "--sync", "--confdir", profile["confdir"]],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            # Reload cache after sync, then tell Nautilus to re-query
+            _cache.force_reload()
+            GLib.idle_add(_invalidate_by_uris, uris)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _on_exclude(self, menu, profile, files):
         for f in files:
