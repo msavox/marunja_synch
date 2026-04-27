@@ -234,6 +234,13 @@ def _config_set(confdir: str, key: str, value: str):
         f.writelines(new_lines)
 
 
+def _restart_service(profile: dict):
+    subprocess.Popen(
+        ["systemctl", "--user", "restart", profile["service"]],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+
 def _exclude_path(profile: dict, abs_path: str, is_dir: bool):
     """Add abs_path to skip_dir or skip_file in the profile config."""
     rel = os.path.relpath(abs_path, profile["sync_dir"])
@@ -243,11 +250,18 @@ def _exclude_path(profile: dict, abs_path: str, is_dir: bool):
     if rel not in patterns:
         patterns.append(rel)
         _config_set(profile["confdir"], key, "|".join(patterns))
-    # Restart the systemd user service to pick up config change
-    subprocess.Popen(
-        ["systemctl", "--user", "restart", profile["service"]],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    _restart_service(profile)
+
+
+def _reinclude_path(profile: dict, abs_path: str, is_dir: bool):
+    """Remove abs_path from skip_dir or skip_file in the profile config."""
+    rel = os.path.relpath(abs_path, profile["sync_dir"])
+    key = "skip_dir" if is_dir else "skip_file"
+    current = _config_get(profile["confdir"], key)
+    patterns = [p for p in current.split("|") if p] if current else []
+    patterns = [p for p in patterns if p != rel]
+    _config_set(profile["confdir"], key, "|".join(patterns))
+    _restart_service(profile)
 
 
 # ---------------------------------------------------------------------------
@@ -295,76 +309,84 @@ class MarunjaSyncProvider(GObject.GObject, Nautilus.ColumnProvider, Nautilus.Inf
 
 class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
 
-    def _build_menu_items(self, files):
-        """Return menu items if all selected files belong to the same profile."""
-        if not files:
-            return []
-
-        # All files must be local and inside a sync dir
-        profiles_found = set()
-        for f in files:
-            if f.get_uri_scheme() != "file":
-                return []
-            p = _profile_for_path(f.get_location().get_path())
-            if p is None:
-                return []
-            profiles_found.add(p["name"])
-
-        if len(profiles_found) != 1:
-            return []  # mixed profiles, skip
-
-        profile = _profile_for_path(files[0].get_location().get_path())
-        items = []
-
-        # Extract paths/URIs as plain strings now — GObject file refs may be
-        # garbage-collected by the time the menu item is activated.
-        file_infos = [
+    def _extract_infos(self, files):
+        """Extract stable string data from GObject file refs before they're GC'd."""
+        return [
             {
                 "abs_path": f.get_location().get_path(),
                 "uri":      f.get_uri(),
                 "is_dir":   f.get_file_type().value_nick == "directory",
             }
             for f in files
+            if f.get_uri_scheme() == "file"
         ]
 
-        # --- Sync Now ---
-        sync_item = Nautilus.MenuItem(
+    def get_file_items(self, *args):
+        """Right-click on selected files/folders: Exclude or Re-include."""
+        files = args[-1]
+        if not files:
+            return []
+
+        infos = self._extract_infos(files)
+        profiles = {_profile_for_path(fi["abs_path"]) for fi in infos}
+        profiles.discard(None)
+        if len(profiles) != 1:
+            return []
+
+        profile = profiles.pop()
+        # Skip root sync dir itself
+        infos = [fi for fi in infos if fi["abs_path"] != profile["sync_dir"]]
+        if not infos:
+            return []
+
+        items = []
+        excluded = [fi for fi in infos if _cache.get(fi["abs_path"]) == STATUS_EXCLUDED]
+        included = [fi for fi in infos if _cache.get(fi["abs_path"]) != STATUS_EXCLUDED]
+
+        if included:
+            item = Nautilus.MenuItem(
+                name="MarunjaSyncMenu::exclude",
+                label="Exclude from Sync",
+                tip="Stop syncing this item",
+            )
+            item.connect("activate", self._on_exclude, profile, included)
+            items.append(item)
+
+        if excluded:
+            item = Nautilus.MenuItem(
+                name="MarunjaSyncMenu::reinclude",
+                label="Re-include in Sync",
+                tip="Resume syncing this item",
+            )
+            item.connect("activate", self._on_reinclude, profile, excluded)
+            items.append(item)
+
+        return items
+
+    def get_background_items(self, *args):
+        """Right-click on folder background: Sync Now."""
+        folder = args[-1]
+        if not folder or folder.get_uri_scheme() != "file":
+            return []
+
+        abs_path = folder.get_location().get_path()
+        profile = _profile_for_path(abs_path)
+        if not profile:
+            return []
+
+        item = Nautilus.MenuItem(
             name="MarunjaSyncMenu::sync_now",
             label=f"Sync Now  [{profile['name']}]",
             tip="Force an immediate sync with OneDrive / SharePoint",
         )
-        sync_item.connect("activate", self._on_sync_now, profile, file_infos)
-        items.append(sync_item)
-
-        # --- Exclude from Sync (not shown on the root sync dir itself) ---
-        non_root = [fi for fi in file_infos if fi["abs_path"] != profile["sync_dir"]]
-        if non_root:
-            excl_item = Nautilus.MenuItem(
-                name="MarunjaSyncMenu::exclude",
-                label="Exclude from Sync",
-                tip="Stop syncing this item and restart the sync service",
-            )
-            excl_item.connect("activate", self._on_exclude, profile, non_root)
-            items.append(excl_item)
-
-        return items
-
-    def get_file_items(self, *args):
-        # Nautilus 3 passes (window, files), Nautilus 4 passes just (files,)
-        files = args[-1]
-        return self._build_menu_items(files)
-
-    def get_background_items(self, *args):
-        folder = args[-1]
-        return self._build_menu_items([folder])
+        uri = folder.get_uri()
+        item.connect("activate", self._on_sync_now, profile, uri)
+        return [item]
 
     # --- Handlers ---
 
-    def _on_sync_now(self, menu, profile, file_infos):
-        uris = [fi["uri"] for fi in file_infos]
-        for fi in file_infos:
-            _cache.set_pending(fi["abs_path"])
-        GLib.idle_add(_invalidate_by_uris, uris)
+    def _on_sync_now(self, menu, profile, folder_uri):
+        GLib.idle_add(_invalidate_by_uris, [folder_uri])
 
         def _run():
             subprocess.run(
@@ -372,7 +394,7 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             _cache.force_reload()
-            GLib.idle_add(_invalidate_by_uris, uris)
+            GLib.idle_add(_invalidate_by_uris, [folder_uri])
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -381,4 +403,11 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         for fi in file_infos:
             _cache.exclude(fi["abs_path"])
             _exclude_path(profile, fi["abs_path"], fi["is_dir"])
+        GLib.idle_add(_invalidate_by_uris, uris)
+
+    def _on_reinclude(self, menu, profile, file_infos):
+        uris = [fi["uri"] for fi in file_infos]
+        for fi in file_infos:
+            _cache.set_pending(fi["abs_path"])
+            _reinclude_path(profile, fi["abs_path"], fi["is_dir"])
         GLib.idle_add(_invalidate_by_uris, uris)
