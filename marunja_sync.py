@@ -1,8 +1,11 @@
 """
-Marunja Sync - Nautilus extension for OneDrive/SharePoint sync status column.
+Marunja Sync - Nautilus extension for OneDrive/SharePoint sync status column
+and right-click context menu actions.
 
-Shows a "Sync" column in Nautilus list view reflecting the state from
-abraunegg/onedrive SQLite databases.
+Features:
+- "Sync" column in list view (✓ Synced / ⟳ Pending / ✗ Error / — Ignored)
+- Emblem overlay on file/folder icons
+- Right-click menu: Sync Now, Exclude from Sync
 
 Install:
     cp marunja_sync.py ~/.local/share/nautilus-python/extensions/
@@ -10,8 +13,10 @@ Install:
 """
 
 import os
+import re
 import sqlite3
 import shutil
+import subprocess
 import threading
 import time
 from gi.repository import Nautilus, GObject
@@ -22,13 +27,17 @@ from gi.repository import Nautilus, GObject
 PROFILES = [
     {
         "name": "OneDrive",
-        "db": os.path.expanduser("~/.config/onedrive/items.sqlite3"),
+        "db":       os.path.expanduser("~/.config/onedrive/items.sqlite3"),
         "sync_dir": os.path.expanduser("~/onedrive"),
+        "confdir":  os.path.expanduser("~/.config/onedrive"),
+        "service":  "onedrive",
     },
     {
         "name": "SharePoint/HERA",
-        "db": os.path.expanduser("~/.config/onedrive-sp-separationring/items.sqlite3"),
+        "db":       os.path.expanduser("~/.config/onedrive-sp-separationring/items.sqlite3"),
         "sync_dir": os.path.expanduser("~/sharepoint/HERA"),
+        "confdir":  os.path.expanduser("~/.config/onedrive-sp-separationring"),
+        "service":  "onedrive-sp-separationring",
     },
 ]
 
@@ -110,6 +119,14 @@ def _load_all_profiles() -> dict:
     return combined
 
 
+def _profile_for_path(abs_path: str):
+    """Return the profile dict whose sync_dir contains abs_path, or None."""
+    for profile in PROFILES:
+        if abs_path == profile["sync_dir"] or abs_path.startswith(profile["sync_dir"] + "/"):
+            return profile
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Background cache with periodic refresh
 # ---------------------------------------------------------------------------
@@ -137,7 +154,61 @@ _cache = _SyncCache()
 
 
 # ---------------------------------------------------------------------------
-# Nautilus extension
+# Config helpers for Exclude action
+# ---------------------------------------------------------------------------
+
+def _config_get(confdir: str, key: str) -> str:
+    """Read a single key value from onedrive config file."""
+    config_path = os.path.join(confdir, "config")
+    if not os.path.exists(config_path):
+        return ""
+    with open(config_path) as f:
+        for line in f:
+            m = re.match(rf'^\s*{re.escape(key)}\s*=\s*"?([^"]*)"?\s*$', line)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
+def _config_set(confdir: str, key: str, value: str):
+    """Set a key in onedrive config, appending if not present."""
+    config_path = os.path.join(confdir, "config")
+    lines = []
+    found = False
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            lines = f.readlines()
+    new_lines = []
+    for line in lines:
+        if re.match(rf'^\s*{re.escape(key)}\s*=', line):
+            new_lines.append(f'{key} = "{value}"\n')
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f'{key} = "{value}"\n')
+    with open(config_path, "w") as f:
+        f.writelines(new_lines)
+
+
+def _exclude_path(profile: dict, abs_path: str, is_dir: bool):
+    """Add abs_path to skip_dir or skip_file in the profile config."""
+    rel = os.path.relpath(abs_path, profile["sync_dir"])
+    key = "skip_dir" if is_dir else "skip_file"
+    current = _config_get(profile["confdir"], key)
+    patterns = [p for p in current.split("|") if p] if current else []
+    if rel not in patterns:
+        patterns.append(rel)
+        _config_set(profile["confdir"], key, "|".join(patterns))
+    # Restart the systemd user service to pick up config change
+    subprocess.Popen(
+        ["systemctl", "--user", "restart", profile["service"]],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+
+# ---------------------------------------------------------------------------
+# Nautilus column + info provider
 # ---------------------------------------------------------------------------
 
 class MarunjaSyncProvider(GObject.GObject, Nautilus.ColumnProvider, Nautilus.InfoProvider):
@@ -170,7 +241,79 @@ class MarunjaSyncProvider(GObject.GObject, Nautilus.ColumnProvider, Nautilus.Inf
 
         file.add_string_attribute("sync_status", status or "")
 
-        # Emblem overlay on the file icon
         emblem = _STATUS_EMBLEM.get(status)
         if emblem:
             file.add_emblem(emblem)
+
+
+# ---------------------------------------------------------------------------
+# Nautilus right-click menu provider
+# ---------------------------------------------------------------------------
+
+class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
+
+    def _build_menu_items(self, files):
+        """Return menu items if all selected files belong to the same profile."""
+        if not files:
+            return []
+
+        # All files must be local and inside a sync dir
+        profiles_found = set()
+        for f in files:
+            if f.get_uri_scheme() != "file":
+                return []
+            p = _profile_for_path(f.get_location().get_path())
+            if p is None:
+                return []
+            profiles_found.add(p["name"])
+
+        if len(profiles_found) != 1:
+            return []  # mixed profiles, skip
+
+        profile = _profile_for_path(files[0].get_location().get_path())
+        items = []
+
+        # --- Sync Now ---
+        sync_item = Nautilus.MenuItem(
+            name="MarunjaSyncMenu::sync_now",
+            label=f"Sync Now  [{profile['name']}]",
+            tip="Force an immediate sync with OneDrive / SharePoint",
+        )
+        sync_item.connect("activate", self._on_sync_now, profile)
+        items.append(sync_item)
+
+        # --- Exclude from Sync (not shown on the root sync dir itself) ---
+        non_root = [f for f in files if f.get_location().get_path() != profile["sync_dir"]]
+        if non_root:
+            excl_item = Nautilus.MenuItem(
+                name="MarunjaSyncMenu::exclude",
+                label="Exclude from Sync",
+                tip="Stop syncing this item and restart the sync service",
+            )
+            excl_item.connect("activate", self._on_exclude, profile, non_root)
+            items.append(excl_item)
+
+        return items
+
+    def get_file_items(self, *args):
+        # Nautilus 3 passes (window, files), Nautilus 4 passes just (files,)
+        files = args[-1]
+        return self._build_menu_items(files)
+
+    def get_background_items(self, *args):
+        folder = args[-1]
+        return self._build_menu_items([folder])
+
+    # --- Handlers ---
+
+    def _on_sync_now(self, menu, profile):
+        subprocess.Popen(
+            ["onedrive", "--sync", "--confdir", profile["confdir"]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    def _on_exclude(self, menu, profile, files):
+        for f in files:
+            abs_path = f.get_location().get_path()
+            is_dir = f.get_file_type().value_nick == "directory"
+            _exclude_path(profile, abs_path, is_dir)
