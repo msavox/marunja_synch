@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 import weakref
 from gi.repository import Nautilus, GObject, GLib
 
@@ -477,7 +478,19 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             with _cache._lock:
                 _cache._data = fresh
                 _cache._overrides.clear()
-            GLib.idle_add(_invalidate_by_uris, [folder_uri])
+
+            # Build URI list for the folder + its immediate children so
+            # the column refreshes instantly, no need to wait for the
+            # background timer to tick.
+            uris = [folder_uri]
+            folder_path = urllib.parse.unquote(folder_uri[7:]) if folder_uri.startswith("file://") else None
+            if folder_path and os.path.isdir(folder_path):
+                try:
+                    for name in os.listdir(folder_path):
+                        uris.append(folder_uri + "/" + urllib.parse.quote(name))
+                except OSError:
+                    pass
+            GLib.idle_add(_invalidate_by_uris, uris)
 
         threading.Thread(target=_run, daemon=True).start()
 
