@@ -328,12 +328,13 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             return []
 
         infos = self._extract_infos(files)
-        profiles = {_profile_for_path(fi["abs_path"]) for fi in infos}
-        profiles.discard(None)
-        if len(profiles) != 1:
+        profile_names = {_profile_for_path(fi["abs_path"])["name"]
+                         for fi in infos
+                         if _profile_for_path(fi["abs_path"]) is not None}
+        if len(profile_names) != 1:
             return []
 
-        profile = profiles.pop()
+        profile = _profile_for_path(infos[0]["abs_path"])
         items = []
 
         # If selection IS the root sync dir → only Sync Now
