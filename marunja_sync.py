@@ -176,12 +176,15 @@ class _SyncCache:
             }
             self._overrides[abs_path] = STATUS_PENDING
 
-    def force_reload(self):
-        """Reload DB immediately (called after a sync completes)."""
+    def force_reload(self) -> list:
+        """Reload DB immediately. Returns URIs of paths that were in overrides
+        so the caller can invalidate them in Nautilus."""
         fresh = _load_all_profiles()
         with self._lock:
+            stale_uris = ["file://" + p for p in self._overrides]
             self._data = fresh
             self._overrides.clear()
+        return stale_uris
 
 
 _cache = _SyncCache()
@@ -403,8 +406,8 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                 ["onedrive", "--sync", "--confdir", profile["confdir"]],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            _cache.force_reload()
-            GLib.idle_add(_invalidate_by_uris, [folder_uri])
+            stale_uris = _cache.force_reload()
+            GLib.idle_add(_invalidate_by_uris, [folder_uri] + stale_uris)
 
         threading.Thread(target=_run, daemon=True).start()
 
