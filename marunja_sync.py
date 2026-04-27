@@ -322,7 +322,7 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         ]
 
     def get_file_items(self, *args):
-        """Right-click on selected files/folders: Exclude or Re-include."""
+        """Right-click on selected files/folders."""
         files = args[-1]
         if not files:
             return []
@@ -334,12 +334,21 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             return []
 
         profile = profiles.pop()
-        # Skip root sync dir itself
-        infos = [fi for fi in infos if fi["abs_path"] != profile["sync_dir"]]
-        if not infos:
-            return []
-
         items = []
+
+        # If selection IS the root sync dir → only Sync Now
+        root_selected = any(fi["abs_path"] == profile["sync_dir"] for fi in infos)
+        if root_selected:
+            item = Nautilus.MenuItem(
+                name="MarunjaSyncMenu::sync_now_file",
+                label=f"Sync Now  [{profile['name']}]",
+                tip="Force an immediate sync with OneDrive / SharePoint",
+            )
+            uri = infos[0]["uri"]
+            item.connect("activate", self._on_sync_now, profile, uri)
+            return [item]
+
+        # Normal items: Exclude or Re-include
         excluded = [fi for fi in infos if _cache.get(fi["abs_path"]) == STATUS_EXCLUDED]
         included = [fi for fi in infos if _cache.get(fi["abs_path"]) != STATUS_EXCLUDED]
 
