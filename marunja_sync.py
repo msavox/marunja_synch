@@ -346,12 +346,14 @@ class MarunjaSyncProvider(GObject.GObject, Nautilus.ColumnProvider, Nautilus.Inf
                     # few times so a freshly-synced item stops showing Ignored.
                     _file_ref = [file]
                     _attempts = [0]
+                    # Generous cap: covers cases where the onedrive service
+                    # is down and needs manual recovery (--resync etc.)
+                    _MAX_ATTEMPTS = (30 * 60) // 5  # 30 min at 5s
                     def _recheck_ignored():
                         _attempts[0] += 1
                         new_status = _cache.get(abs_path)
                         if new_status is None:
-                            # Give up after ~2 full refresh cycles
-                            if _attempts[0] >= (2 * REFRESH_INTERVAL) // 5:
+                            if _attempts[0] >= _MAX_ATTEMPTS:
                                 _file_ref.clear()
                                 return False
                             return True
