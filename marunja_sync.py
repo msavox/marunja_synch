@@ -45,17 +45,19 @@ PROFILES = [
 REFRESH_INTERVAL = 30
 
 # Status display strings
-STATUS_SYNCED  = "✓ Synced"
-STATUS_PENDING = "⟳ Pending"
-STATUS_ERROR   = "✗ Error"
-STATUS_IGNORED = "— Ignored"
+STATUS_SYNCED   = "✓ Synced"
+STATUS_PENDING  = "⟳ Pending"
+STATUS_ERROR    = "✗ Error"
+STATUS_IGNORED  = "— Ignored"
+STATUS_EXCLUDED = "⊘ Excluded"
 
 # Emblem names from the system icon theme overlaid on file icons
 _STATUS_EMBLEM = {
-    STATUS_SYNCED:  "emblem-default",       # green checkmark
-    STATUS_PENDING: "emblem-synchronizing", # spinning arrows
-    STATUS_ERROR:   "emblem-important",     # red/yellow warning
-    STATUS_IGNORED: None,                   # no emblem
+    STATUS_SYNCED:   "emblem-default",       # green checkmark
+    STATUS_PENDING:  "emblem-synchronizing", # spinning arrows
+    STATUS_ERROR:    "emblem-important",     # red/yellow warning
+    STATUS_EXCLUDED: "emblem-important",     # same warning badge for excluded
+    STATUS_IGNORED:  None,                   # no emblem
 }
 
 # ---------------------------------------------------------------------------
@@ -135,6 +137,7 @@ class _SyncCache:
     def __init__(self):
         self._lock = threading.Lock()
         self._data: dict = _load_all_profiles()  # initial synchronous load
+        self._excluded: set = set()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -147,7 +150,16 @@ class _SyncCache:
 
     def get(self, abs_path: str):
         with self._lock:
+            # Check excluded set first (covers both the item and its children)
+            for excl in self._excluded:
+                if abs_path == excl or abs_path.startswith(excl + "/"):
+                    return STATUS_EXCLUDED
             return self._data.get(abs_path)
+
+    def exclude(self, abs_path: str):
+        """Mark a path as excluded immediately, before the next DB reload."""
+        with self._lock:
+            self._excluded.add(abs_path)
 
 
 _cache = _SyncCache()
@@ -316,4 +328,8 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         for f in files:
             abs_path = f.get_location().get_path()
             is_dir = f.get_file_type().value_nick == "directory"
+            # Update cache immediately so badge/column change right away
+            _cache.exclude(abs_path)
+            f.invalidate_extension_info()
+            # Then persist to config and restart service
             _exclude_path(profile, abs_path, is_dir)
