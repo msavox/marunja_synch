@@ -62,6 +62,44 @@ _STATUS_EMBLEM = {
 }
 
 # ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _config_get(confdir: str, key: str) -> str:
+    """Read a single key value from onedrive config file."""
+    config_path = os.path.join(confdir, "config")
+    if not os.path.exists(config_path):
+        return ""
+    with open(config_path) as f:
+        for line in f:
+            m = re.match(rf'^\s*{re.escape(key)}\s*=\s*"?([^"]*)"?\s*$', line)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
+def _config_set(confdir: str, key: str, value: str):
+    """Set a key in onedrive config, appending if not present."""
+    config_path = os.path.join(confdir, "config")
+    lines = []
+    found = False
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            lines = f.readlines()
+    new_lines = []
+    for line in lines:
+        if re.match(rf'^\s*{re.escape(key)}\s*=', line):
+            new_lines.append(f'{key} = "{value}"\n')
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f'{key} = "{value}"\n')
+    with open(config_path, "w") as f:
+        f.writelines(new_lines)
+
+
+# ---------------------------------------------------------------------------
 # DB loader: builds a dict of absolute_path -> status_string
 # ---------------------------------------------------------------------------
 
@@ -228,40 +266,6 @@ def _invalidate_by_uris(uris: list):
 # ---------------------------------------------------------------------------
 # Config helpers for Exclude action
 # ---------------------------------------------------------------------------
-
-def _config_get(confdir: str, key: str) -> str:
-    """Read a single key value from onedrive config file."""
-    config_path = os.path.join(confdir, "config")
-    if not os.path.exists(config_path):
-        return ""
-    with open(config_path) as f:
-        for line in f:
-            m = re.match(rf'^\s*{re.escape(key)}\s*=\s*"?([^"]*)"?\s*$', line)
-            if m:
-                return m.group(1).strip()
-    return ""
-
-
-def _config_set(confdir: str, key: str, value: str):
-    """Set a key in onedrive config, appending if not present."""
-    config_path = os.path.join(confdir, "config")
-    lines = []
-    found = False
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            lines = f.readlines()
-    new_lines = []
-    for line in lines:
-        if re.match(rf'^\s*{re.escape(key)}\s*=', line):
-            new_lines.append(f'{key} = "{value}"\n')
-            found = True
-        else:
-            new_lines.append(line)
-    if not found:
-        new_lines.append(f'{key} = "{value}"\n')
-    with open(config_path, "w") as f:
-        f.writelines(new_lines)
-
 
 def _restart_service(profile: dict):
     subprocess.Popen(
