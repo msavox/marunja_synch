@@ -2,7 +2,7 @@
   <img src="marunja_logo.png" width="120" alt="Marunja logo" />
 </p>
 
-<h1 align="center">marunja_synch</h1>
+<h1 align="center">Marunja Synch</h1>
 
 <p align="center">
   Nautilus extension that shows OneDrive &amp; SharePoint sync status as a column in list view.<br/>
