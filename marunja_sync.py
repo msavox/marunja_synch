@@ -341,6 +341,27 @@ class MarunjaSyncProvider(GObject.GObject, Nautilus.ColumnProvider, Nautilus.Inf
                     break
                 elif abs_path.startswith(profile["sync_dir"] + "/"):
                     status = STATUS_IGNORED
+                    # The DB might not yet know about this path (e.g. just
+                    # added/synced after the last cache reload). Re-check a
+                    # few times so a freshly-synced item stops showing Ignored.
+                    _file_ref = [file]
+                    _attempts = [0]
+                    def _recheck_ignored():
+                        _attempts[0] += 1
+                        new_status = _cache.get(abs_path)
+                        if new_status is None:
+                            # Give up after ~2 full refresh cycles
+                            if _attempts[0] >= (2 * REFRESH_INTERVAL) // 5:
+                                _file_ref.clear()
+                                return False
+                            return True
+                        try:
+                            _file_ref[0].invalidate_extension_info()
+                        except Exception:
+                            pass
+                        _file_ref.clear()
+                        return False
+                    GLib.timeout_add(5000, _recheck_ignored)
                     break
 
         file.add_string_attribute("sync_status", status or "")

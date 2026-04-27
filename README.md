@@ -24,6 +24,10 @@ Adds a **Sync** column in Nautilus list view showing the sync state of each file
 
 Supports multiple profiles simultaneously (OneDrive Business + any number of SharePoint libraries).
 
+<p align="center">
+  <img src="screenshot.png" alt="Marunja sync column in Nautilus" />
+</p>
+
 ---
 
 ## Requirements
