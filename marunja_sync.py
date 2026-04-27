@@ -109,7 +109,7 @@ def _load_all_profiles() -> dict:
 class _SyncCache:
     def __init__(self):
         self._lock = threading.Lock()
-        self._data: dict = {}
+        self._data: dict = _load_all_profiles()  # initial synchronous load
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -150,6 +150,16 @@ class MarunjaSyncProvider(GObject.GObject, Nautilus.ColumnProvider, Nautilus.Inf
 
         abs_path = file.get_location().get_path()
         status = _cache.get(abs_path)
+
+        # Debug: log misses inside sync dirs
+        if status is None:
+            for profile in PROFILES:
+                if abs_path == profile["sync_dir"]:
+                    status = STATUS_SYNCED  # root sync folder itself
+                    break
+                elif abs_path.startswith(profile["sync_dir"]):
+                    status = STATUS_IGNORED
+                    break
 
         if status is None:
             for profile in PROFILES:
