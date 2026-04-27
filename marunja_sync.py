@@ -153,11 +153,9 @@ class _SyncCache:
 
     def get(self, abs_path: str):
         with self._lock:
-            # Excluded takes priority
             for excl in self._excluded:
                 if abs_path == excl or abs_path.startswith(excl + "/"):
                     return STATUS_EXCLUDED
-            # Manual override (e.g. ⟳ Pending set by Sync Now)
             if abs_path in self._overrides:
                 return self._overrides[abs_path]
             return self._data.get(abs_path)
@@ -169,9 +167,13 @@ class _SyncCache:
 
     def set_pending(self, abs_path: str):
         """Show ⟳ Pending immediately while a sync is running.
-        Also removes the path from the excluded set so Sync Now can re-include it."""
+        Removes the path AND any excluded children from the excluded set."""
         with self._lock:
-            self._excluded.discard(abs_path)
+            # Remove exact match and any children (e.g. syncing parent re-includes subs)
+            self._excluded = {
+                e for e in self._excluded
+                if e != abs_path and not e.startswith(abs_path + "/")
+            }
             self._overrides[abs_path] = STATUS_PENDING
 
     def force_reload(self):
@@ -314,17 +316,28 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         profile = _profile_for_path(files[0].get_location().get_path())
         items = []
 
+        # Extract paths/URIs as plain strings now — GObject file refs may be
+        # garbage-collected by the time the menu item is activated.
+        file_infos = [
+            {
+                "abs_path": f.get_location().get_path(),
+                "uri":      f.get_uri(),
+                "is_dir":   f.get_file_type().value_nick == "directory",
+            }
+            for f in files
+        ]
+
         # --- Sync Now ---
         sync_item = Nautilus.MenuItem(
             name="MarunjaSyncMenu::sync_now",
             label=f"Sync Now  [{profile['name']}]",
             tip="Force an immediate sync with OneDrive / SharePoint",
         )
-        sync_item.connect("activate", self._on_sync_now, profile, files)
+        sync_item.connect("activate", self._on_sync_now, profile, file_infos)
         items.append(sync_item)
 
         # --- Exclude from Sync (not shown on the root sync dir itself) ---
-        non_root = [f for f in files if f.get_location().get_path() != profile["sync_dir"]]
+        non_root = [fi for fi in file_infos if fi["abs_path"] != profile["sync_dir"]]
         if non_root:
             excl_item = Nautilus.MenuItem(
                 name="MarunjaSyncMenu::exclude",
@@ -347,32 +360,25 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
 
     # --- Handlers ---
 
-    def _on_sync_now(self, menu, profile, files):
-        # Immediately show ⟳ Pending on all selected files
-        uris = []
-        for f in files:
-            abs_path = f.get_location().get_path()
-            _cache.set_pending(abs_path)
-            f.invalidate_extension_info()
-            uris.append(f.get_uri())
+    def _on_sync_now(self, menu, profile, file_infos):
+        uris = [fi["uri"] for fi in file_infos]
+        for fi in file_infos:
+            _cache.set_pending(fi["abs_path"])
+        GLib.idle_add(_invalidate_by_uris, uris)
 
         def _run():
-            proc = subprocess.run(
+            subprocess.run(
                 ["onedrive", "--sync", "--confdir", profile["confdir"]],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            # Reload cache after sync, then tell Nautilus to re-query
             _cache.force_reload()
             GLib.idle_add(_invalidate_by_uris, uris)
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_exclude(self, menu, profile, files):
-        for f in files:
-            abs_path = f.get_location().get_path()
-            is_dir = f.get_file_type().value_nick == "directory"
-            # Update cache immediately so badge/column change right away
-            _cache.exclude(abs_path)
-            f.invalidate_extension_info()
-            # Then persist to config and restart service
-            _exclude_path(profile, abs_path, is_dir)
+    def _on_exclude(self, menu, profile, file_infos):
+        uris = [fi["uri"] for fi in file_infos]
+        for fi in file_infos:
+            _cache.exclude(fi["abs_path"])
+            _exclude_path(profile, fi["abs_path"], fi["is_dir"])
+        GLib.idle_add(_invalidate_by_uris, uris)
