@@ -168,8 +168,10 @@ class _SyncCache:
             self._excluded.add(abs_path)
 
     def set_pending(self, abs_path: str):
-        """Show ⟳ Pending immediately while a sync is running."""
+        """Show ⟳ Pending immediately while a sync is running.
+        Also removes the path from the excluded set so Sync Now can re-include it."""
         with self._lock:
+            self._excluded.discard(abs_path)
             self._overrides[abs_path] = STATUS_PENDING
 
     def force_reload(self):
