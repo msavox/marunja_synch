@@ -1,0 +1,5 @@
+# AUTO-GENERATO da Claude per il trasferimento su Mac (2026-05-16)
+# Progetto senza dependency manager: dedotto dagli import di marunja_sync.py.
+# Tutte le dipendenze sono stdlib TRANNE "gi" (PyGObject/GTK):
+#     Su Mac NON installabile via pip -> `brew install pygobject3 gtk+3`
+#     (vedi IMPORTA_SU_MAC.md)

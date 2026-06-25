@@ -41,6 +41,13 @@ PROFILES = [
         "confdir":  os.path.expanduser("~/.config/onedrive-sp-separationring"),
         "service":  "onedrive-sp-separationring",
     },
+    {
+        "name": "SharePoint/TechOps",
+        "db":       os.path.expanduser("~/.config/onedrive-sp-techops/items.sqlite3"),
+        "sync_dir": os.path.expanduser("~/sharepoint/TechOps"),
+        "confdir":  os.path.expanduser("~/.config/onedrive-sp-techops"),
+        "service":  "onedrive-sp-techops",
+    },
 ]
 
 # How often (seconds) to reload the databases in background
@@ -268,11 +275,30 @@ def _invalidate_by_uris(uris: list):
 # Config helpers for Exclude action
 # ---------------------------------------------------------------------------
 
-def _restart_service(profile: dict):
-    subprocess.Popen(
-        ["systemctl", "--user", "restart", profile["service"]],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+def _apply_skip_change(profile: dict):
+    """Apply a skip_dir/skip_file change SAFELY.
+
+    abraunegg requires a --resync after ANY skip_dir/skip_file change; a bare
+    `systemctl restart` makes the client refuse to start ("configuration change
+    detected where a --resync is required") and the service crash-loops.
+
+    We rebuild the state DB from the server as source of truth using
+    --download-only, which guarantees ZERO uploads and preserves local-only
+    files (never deletes them). This means excluding a folder can never
+    re-upload a colleague's remote deletes. Then we resume the normal two-way
+    monitor. Runs in a background thread because a resync walks the whole drive
+    and can take minutes (a blocking call would freeze Nautilus)."""
+    def _run():
+        subprocess.run(["systemctl", "--user", "stop", profile["service"]],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["onedrive", "--confdir", profile["confdir"],
+             "--sync", "--resync", "--resync-auth", "--download-only"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        subprocess.run(["systemctl", "--user", "start", profile["service"]],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _exclude_path(profile: dict, abs_path: str, is_dir: bool):
@@ -284,7 +310,7 @@ def _exclude_path(profile: dict, abs_path: str, is_dir: bool):
     if rel not in patterns:
         patterns.append(rel)
         _config_set(profile["confdir"], key, "|".join(patterns))
-    _restart_service(profile)
+    _apply_skip_change(profile)
 
 
 def _reinclude_path(profile: dict, abs_path: str, is_dir: bool):
@@ -295,7 +321,7 @@ def _reinclude_path(profile: dict, abs_path: str, is_dir: bool):
     patterns = [p for p in current.split("|") if p] if current else []
     patterns = [p for p in patterns if p != rel]
     _config_set(profile["confdir"], key, "|".join(patterns))
-    _restart_service(profile)
+    _apply_skip_change(profile)
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +445,17 @@ class MarunjaSyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             uri = infos[0]["uri"]
             item.connect("activate", self._on_sync_now, profile, uri)
             return [item]
+
+        # Sync Now: force an immediate sync regardless of what's selected.
+        # The sync is whole-profile; we refresh the first selected item (the
+        # 30s background timer picks up the rest).
+        sync_item = Nautilus.MenuItem(
+            name="MarunjaSyncMenu::sync_now_sel",
+            label=f"Sync Now  [{profile['name']}]",
+            tip="Force an immediate sync with OneDrive / SharePoint",
+        )
+        sync_item.connect("activate", self._on_sync_now, profile, infos[0]["uri"])
+        items.append(sync_item)
 
         # Normal items: Exclude or Re-include
         excluded = [fi for fi in infos if _cache.get(fi["abs_path"]) == STATUS_EXCLUDED]
